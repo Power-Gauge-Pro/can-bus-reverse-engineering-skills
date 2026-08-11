@@ -172,6 +172,29 @@ messages — and the ones it silently discards are the slow, low-rate IDs that c
 status and body signals. A 1 Hz message yields ~30 frames in a 30 s window, so a
 `>= 40` rule drops it entirely. Use `common.min_samples_for(group, seconds)`.
 
+**Before writing "not on this bus", clear this gate.** A confident negative is
+worse than a miss, because it closes the question and invites a tidy structural
+story ("it must be on the body bus") that is easy to believe and hard to unlearn.
+All five checks, or say "not established" instead:
+
+1. **Rate.** If the thing is periodic, can the message even represent it?
+   Nyquist: a message sampled at F Hz cannot show anything above F/2, so
+   searching a 1 Hz message for a 1.3 Hz blink CANNOT succeed however long you
+   look. `common.observable_hz()` / `unobservable_ids()` name the IDs where a
+   negative proves nothing; `segments.py --flash-hz` prints them for you.
+2. **Shape.** Did you search for the right KIND of signal? A held state, an
+   enum, an indicator and a continuous quantity each need a different test, and
+   `correlate`/`bitsearch` only fit a line. Run `segments.py` — `--mode state`
+   for something that persists, `--mode indicator` for an on/off condition.
+3. **Geometry.** Both endiannesses, arbitrary offsets, all lengths (`--deep`,
+   `bitsearch` per ID), and `--interp all` if the encoding could be non-linear.
+4. **Slow IDs.** Confirm low-rate messages were not dropped by a sample-count
+   threshold. Status and body signals live there.
+5. **Say what would have been found.** State the evidence you would expect if the
+   signal WERE present, and confirm you looked for that specific thing. "I found
+   no flashing bit" is not the same as "there is no indicator" — the bus may
+   report a slow state enum instead of a lamp.
+
 **A weak `correlate` result is NOT evidence of absence.** Byte-aligned triage
 under-ranks any ID whose signal sits at a non-byte offset. Before concluding a
 signal is not present: re-run with `--deep`, run `bitsearch.py` directly on every
@@ -207,6 +230,15 @@ resolve the native unit, and you need a better one.
 **When two framings are near-collinear**, R² cannot separate them and a tie-break
 may pick the wrong one; scale roundness is the tie-break to reach for, subject to
 everything above.
+
+**Name a signal only as far as the evidence goes.** Cornering separates left from
+right, because the outer wheel of a turn travels further — yaw rate gives you the
+sign. It says nothing about front versus rear, which needs a different excitation
+(drive or brake bias, a launch, a wheel-slip event). Same for any paired or
+mirrored quantity. If the evidence fixes one axis and not the other, encode that in
+the name (`_A_L` / `_B_L` rather than `Front...` / `Rear...`) and say so — a
+confident wrong label survives into every downstream consumer, while an honest
+placeholder invites the one extra experiment that would settle it.
 
 Run `python scripts/selftest_geometry.py` after touching any candidate generation,
 extraction, or interpretation code.

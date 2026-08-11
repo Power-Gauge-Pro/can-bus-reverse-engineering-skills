@@ -43,6 +43,7 @@ def load_dbcs(path: str) -> dict:
     out: dict[int, list] = {}
     files = sorted(glob.glob(os.path.join(path, "**", "*.dbc"), recursive=True))
     loaded = 0
+    seen: set = set()
     for p in files:
         try:
             db = cantools.database.load_file(p)
@@ -51,8 +52,14 @@ def load_dbcs(path: str) -> dict:
         loaded += 1
         for m in db.messages:
             for s in m.signals:
-                out.setdefault(m.frame_id, []).append(
-                    (s.name, set(signal_bits(s, m.length)), s))
+                bits = frozenset(signal_bits(s, m.length))
+                # A combined application DBC repeats every per-signal file, so
+                # dedupe on (id, name, bits) or every signal is counted twice.
+                key = (m.frame_id, s.name, bits)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.setdefault(m.frame_id, []).append((s.name, set(bits), s))
     return out, loaded, len(files)
 
 

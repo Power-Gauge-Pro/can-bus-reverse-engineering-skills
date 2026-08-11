@@ -612,6 +612,19 @@ def main() -> int:
                           sorted(mapping.items(), key=lambda kv: kv[1]))
         print(f"  state   {sp}  ({len(df)} transitions; {order})")
 
+    if states:
+        print()
+        print("  NEXT — run the categorical search against EVERY state sidecar above.")
+        print("  A held state or an indicator will not be found by correlate/bitsearch:")
+        print("  those fit a line, and a code point has no line to fit.")
+        for fam in sorted(states):
+            sp = os.path.join(args.out_dir, f"sidecar_state_{fam}_{tag}.csv")
+            print(f"    python scripts/segments.py --trace {trace_path} "
+                  f"--sidecar {sp}")
+        print("  For an on/off condition (a lamp or indicator), add --mode indicator;")
+        print("  if the real thing blinks, add --flash-hz <rate> so IDs too slow to")
+        print("  show it are named - a negative on those proves nothing.")
+
     vid = os.path.join(args.run, run.get("video", {}).get("file", "video.mp4"))
     if os.path.exists(vid):
         v_start = run.get("video", {}).get("started_utc")

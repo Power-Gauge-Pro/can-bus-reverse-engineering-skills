@@ -337,6 +337,20 @@ def _finalize(args, samples, sampled, read_ok, start_epoch) -> int:
     elif jump_src == "manual":
         print(f"  clean: rejected {by_jump} jump outlier(s) > {eff_jump:.3g} {args.unit} "
               f"(--max-jump), {by_conf} below conf {args.conf}")
+    # The adaptive jump-reject is derived from the reads themselves, so a genuinely
+    # fast-moving signal can look like a field of outliers and lose a large share of
+    # GOOD reads - silently, since what remains still looks like a clean series.
+    # Warn whenever it discards a meaningful fraction, and say what to do about it.
+    if by_jump and read_ok:
+        frac = by_jump / float(read_ok)
+        if frac >= 0.10:
+            print(f"  [!] auto-clean discarded {by_jump} of {read_ok} successful reads "
+                  f"({100*frac:.0f}%). That is a lot to lose to outlier rejection, and "
+                  f"a fast-changing signal can trip it legitimately.", file=sys.stderr)
+            print(f"      Check the RAW reads in the diagnostics CSV against an "
+                  f"independent reference before accepting this series; if the "
+                  f"discarded reads track it, re-run with a larger --max-jump "
+                  f"(try {eff_jump * 2:.3g}) or --no-auto-clean.", file=sys.stderr)
     if distinct < 5 or rate < 1.0:
         print(f"  [!] coarse reference (distinct={distinct}, rate={rate:.1f}Hz) - "
               f"correlation may be unreliable.", file=sys.stderr)

@@ -156,6 +156,85 @@ def tidiness(mapping: dict) -> float:
     return round(score, 3)
 
 
+def indicator_fields(g, segs, min_frames, min_burst=2.0, min_bursts=2,
+                     min_overlap=0.4):
+    """Find a field VALUE that marks an ON condition, robust to sloppy annotations.
+
+    Two things defeat the obvious approach of scoring a field against the annotated
+    ON windows:
+
+      * A shared enum. One small field often covers several mutually exclusive
+        conditions - left, right, none - so during a "left OFF" window it is not
+        constant, and the constant-within-hold test rejects it correctly by its own
+        rules and uselessly in practice.
+      * Human window edges. An operator pressing buttons while driving marks
+        windows late, leaves them running, and misses events entirely. Scoring
+        precision/recall against those edges punishes the RIGHT answer: a field
+        that is genuinely on for 7 s scores terribly against a window left open
+        for 60 s.
+
+    So this looks for STRUCTURE first and uses the annotations only as weak
+    confirmation. A real indicator sits at one idle value nearly all the time and
+    takes another value in short bursts that RECUR. Requiring recurrence is what
+    separates it from a counter or a slow ramp, whose values each appear once.
+    Candidates are then ranked by how much of their burst time falls inside any
+    annotated ON window - a value that is on when nothing was annotated is
+    tolerated (the operator missed it), which is the asymmetry that matters.
+    """
+    on = np.zeros(len(g.t), dtype=bool)
+    for a, b, v in segs:
+        if v:
+            on |= (g.t >= a) & (g.t <= b)
+    if on.sum() < min_frames:
+        return []
+
+    out = []
+    for order, start, length in candidate_fields(g.length):
+        if length > 8:                      # an indicator code is small
+            continue
+        raw = common.extract_any(g, order, start, length)
+        if np.ptp(raw) == 0:
+            continue
+        vals, counts = np.unique(raw, return_counts=True)
+        if len(vals) > 8:
+            continue                        # not a small code set
+        idle = vals[counts.argmax()]
+        if counts.max() / len(raw) < 0.5:
+            continue                        # no dominant idle value
+        for v in vals:
+            if v == idle:
+                continue
+            m = raw == v
+            idx = np.where(m)[0]
+            if len(idx) < 3:
+                continue
+            # contiguous runs separated by >1 s are separate bursts
+            brk = np.where(np.diff(g.t[idx]) > 1.0)[0]
+            runs = np.split(idx, brk + 1)
+            runs = [r for r in runs if len(r) > 1
+                    and (g.t[r[-1]] - g.t[r[0]]) >= min_burst]
+            if len(runs) < min_bursts:
+                continue                    # a value appearing once is a counter
+            burst_t = sum(g.t[r[-1]] - g.t[r[0]] for r in runs)
+            inside = sum(float(on[r].mean()) * (g.t[r[-1]] - g.t[r[0]]) for r in runs)
+            overlap = inside / max(burst_t, 1e-9)
+            if overlap < min_overlap:
+                continue
+            out.append({"order": order, "start_bit": start, "length": length,
+                        "value": float(v), "idle": float(idle),
+                        "n_bursts": len(runs), "burst_s": float(burst_t),
+                        "overlap": float(overlap), "byte": start // 8})
+    out.sort(key=lambda r: (-r["overlap"], -r["n_bursts"]))
+    kept, seen = [], set()
+    for r in out:
+        k = (r["start_bit"], r["length"], r["order"])
+        if k in seen:
+            continue
+        seen.add(k)
+        kept.append(r)
+    return kept
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -174,6 +253,16 @@ def main() -> int:
                          "and can turn 'not on this bus' into a false conclusion.")
     ap.add_argument("--min-purity", type=float, default=0.98)
     ap.add_argument("--ids", default=None, help="restrict to these IDs")
+    ap.add_argument("--mode", choices=["auto", "state", "indicator"], default="auto",
+                    help="'state' = constant-within-hold + one-to-one (a state that "
+                         "PERSISTS). 'indicator' = find a VALUE marking an ON "
+                         "condition, which tolerates a shared enum where several "
+                         "mutually exclusive conditions live in one field. 'auto' "
+                         "runs indicator too whenever the reference is binary.")
+    ap.add_argument("--flash-hz", type=float, default=0.0,
+                    help="if the physical thing blinks at this rate, report which IDs "
+                         "are too slow to show it (Nyquist). A negative result on "
+                         "those IDs is meaningless, not evidence of absence.")
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
@@ -207,6 +296,19 @@ def main() -> int:
     only = {int(x, 0) for x in args.ids.split(",")} if args.ids else None
     groups = common.group_by_id(df)
     shortest = min((b - a) for a, b, _ in segs)
+
+    if args.flash_hz > 0:
+        slow = common.unobservable_ids(groups, args.flash_hz)
+        print(f"[Nyquist] {len(slow)} of {len(groups)} ID(s) are sampled too slowly "
+              f"to show anything at {args.flash_hz:g} Hz; on those, a periodicity "
+              f"search proves nothing:")
+        print("   " + ", ".join(f"0x{c:X}({h:.1f}Hz)" for c, h in slow[:14])
+              + (" ..." if len(slow) > 14 else ""))
+        print()
+
+    ref_states = sorted({v for _, _, v in segs})
+    binary_ref = len(ref_states) == 2
+    run_indicator = args.mode == "indicator" or (args.mode == "auto" and binary_ref)
     results = []
     for cid, g in groups.items():
         if only and cid not in only:
@@ -231,6 +333,33 @@ def main() -> int:
         print("No field is constant within every held segment. Either the state is "
               "not on this bus/window, or the guard is too small - try --guard 3.")
         return 2
+
+    if run_indicator:
+        ind = []
+        for cid, g in groups.items():
+            if only and cid not in only:
+                continue
+            mf = (args.min_frames if args.min_frames > 0
+                  else common.min_samples_for(g, shortest, floor=3))
+            for r in indicator_fields(g, segs, mf):
+                r.update({"id": cid, "id_hex": f"{cid:X}"})
+                ind.append(r)
+        ind.sort(key=lambda r: (-r["overlap"], -r["n_bursts"]))
+        print("INDICATOR candidates - a VALUE that marks the ON state")
+        print("(use this when the condition may share a field with other "
+              "mutually exclusive conditions)\n")
+        print(f"{'id_hex':>7} {'ord':>4} {'start':>6} {'len':>4} {'value':>6} "
+              f"{'idle':>5} {'bursts':>7} {'on_s':>7} {'overlap':>8}")
+        print("-" * 68)
+        for r in ind[:args.top]:
+            print(f"{r['id_hex']:>7} {r['order'][:2]:>4} {r['start_bit']:>6} "
+                  f"{r['length']:>4} {r['value']:>6.0f} {r['idle']:>5.0f} "
+                  f"{r['n_bursts']:>7} {r['burst_s']:>7.1f} {r['overlap']:>7.0%}")
+        if not ind:
+            print("  (none)")
+        print()
+        if args.mode == "indicator":
+            return 0
 
     print(f"Top {min(args.top, len(results))} of {len(results)} constant-in-segment "
           f"field(s):\n")

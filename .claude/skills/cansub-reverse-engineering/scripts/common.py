@@ -544,6 +544,44 @@ def extract_any(g: "IdGroup", order: str, start: int, length: int) -> np.ndarray
     return extract_be_bits(g.be_int, g.length, start, length)
 
 
+def observable_hz(g: "IdGroup") -> float:
+    """Highest frequency this message can represent, from its own cycle time.
+
+    Nyquist: a message sampled at F Hz cannot show any phenomenon faster than
+    F/2. Searching a 1 Hz message for a 1.3 Hz flashing bit therefore CANNOT
+    succeed, however long you look - and the empty result reads as evidence the
+    signal is absent when it is only unobservable. Check before searching for
+    anything periodic.
+    """
+    if g.n < 3:
+        return 0.0
+    dt = np.diff(np.sort(g.t))
+    dt = dt[dt > 0]
+    if len(dt) == 0:
+        return 0.0
+    cycle = float(np.median(dt))
+    return (1.0 / cycle) / 2.0 if cycle > 0 else 0.0
+
+
+def rate_observable(g: "IdGroup", expected_hz: float) -> bool:
+    """Can this message represent a phenomenon at `expected_hz`?"""
+    return expected_hz <= 0 or observable_hz(g) >= expected_hz
+
+
+def unobservable_ids(groups: dict, expected_hz: float) -> list:
+    """[(can_id, observable_hz)] for messages too slow to show `expected_hz`.
+
+    Report these alongside any periodicity search: they are the IDs where a
+    negative result means nothing at all.
+    """
+    out = []
+    for cid, g in groups.items():
+        oh = observable_hz(g)
+        if oh < expected_hz:
+            out.append((cid, oh))
+    return sorted(out, key=lambda x: x[1])
+
+
 def min_samples_for(g: "IdGroup", seconds: float, floor: int = 3) -> int:
     """How many frames of THIS id to expect in `seconds` — a rate-aware threshold.
 
