@@ -294,6 +294,107 @@ def load_trace(path: str, rx_only: bool = True) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Capture health (FORK ADDITION)
+# ---------------------------------------------------------------------------
+#
+# A wireless capture can lose most of its frames without losing any of its
+# *structure*: the CSV still parses, every ID is still present, and correlation
+# still returns a confident top candidate - computed from whatever survived.
+# Nothing downstream notices. These helpers make a collapsed capture loud.
+
+def trace_health(t: np.ndarray, bucket: float = 10.0) -> dict:
+    """Frame-density profile of a trace timeline (epoch seconds)."""
+    t = np.asarray(t, dtype=float)
+    if t.size == 0:
+        return {"n": 0, "healthy_frac": 0.0, "peak_fps": 0.0}
+    lo, hi = float(t.min()), float(t.max())
+    span = hi - lo
+    if span <= 0:
+        return {"n": int(t.size), "healthy_frac": 1.0, "peak_fps": 0.0,
+                "t_lo": lo, "t_hi": hi, "span": 0.0}
+
+    edges = np.arange(lo, hi + bucket, bucket)
+    hist, _ = np.histogram(t, bins=edges)
+    fps = hist / bucket
+    peak = float(np.percentile(fps, 95))
+    healthy = fps > 0.6 * peak if peak > 0 else np.zeros(len(fps), bool)
+
+    uniq = np.unique(t)
+    gaps = np.diff(uniq) if uniq.size > 1 else np.array([0.0])
+    dead = float(gaps[gaps > 1.0].sum())
+
+    return {
+        "n": int(t.size), "t_lo": lo, "t_hi": hi, "span": span,
+        "mean_fps": t.size / span, "peak_fps": peak,
+        "fps": fps, "edges": edges,
+        "healthy_frac": float(healthy.mean()),
+        "healthy_until": float(edges[np.where(healthy)[0].max() + 1] - lo)
+                         if healthy.any() else 0.0,
+        "dead_s": dead, "n_gaps": int((gaps > 1.0).sum()),
+        "max_gap": float(gaps.max()),
+        "frames_per_stamp": t.size / max(uniq.size, 1),
+    }
+
+
+def warn_if_degraded(df: pd.DataFrame, ref_t: np.ndarray | None = None,
+                     *, bucket: float = 10.0, quiet: bool = False) -> bool:
+    """Print a prominent banner when the trace is too sparse to trust.
+
+    If `ref_t` is given, the check is restricted to the span the reference
+    actually covers - that is the only region correlation scores over, so a
+    trace that is healthy overall but dead across the reference window is
+    exactly the case that must be caught.
+
+    Returns True if the capture looks degraded.
+    """
+    t = df["t"].to_numpy(float)
+    scope = "trace"
+    if ref_t is not None and len(ref_t):
+        lo, hi = float(np.min(ref_t)), float(np.max(ref_t))
+        m = (t >= lo) & (t <= hi)
+        if m.sum() == 0:
+            if not quiet:
+                print("\n" + "!" * 72)
+                print("!! NO CAN FRAMES overlap the reference window. Nothing to correlate.")
+                print("!" * 72 + "\n")
+            return True
+        t = t[m]
+        scope = "reference window"
+
+    h = trace_health(t, bucket=bucket)
+    if h["n"] == 0 or h.get("span", 0) <= 0:
+        return False
+
+    problems = []
+    if h["healthy_frac"] < 0.8:
+        problems.append(
+            f"only {h['healthy_frac']*100:.0f}% of {bucket:.0f}s buckets are at "
+            f"full rate (peak {h['peak_fps']:,.0f} fps)")
+    if h["dead_s"] > 0.05 * h["span"]:
+        problems.append(
+            f"{h['dead_s']:.0f}s of {h['span']:.0f}s is dead air across "
+            f"{h['n_gaps']} gap(s), worst {h['max_gap']:.1f}s")
+
+    if not problems:
+        return False
+
+    if not quiet:
+        print("\n" + "!" * 72)
+        print(f"!! DEGRADED CAPTURE over the {scope} - results may be CONFIDENTLY WRONG")
+        for p in problems:
+            print(f"!!   - {p}")
+        if h["healthy_until"] > 0 and h["healthy_frac"] < 0.8:
+            print(f"!!   - last sustained full-rate region ends ~{h['healthy_until']:.0f}s "
+                  f"into the trace")
+        print("!!")
+        print("!! Correlation scores only the frames that SURVIVED, so a collapsed")
+        print("!! capture still produces a confident top candidate. Restrict the")
+        print("!! analysis to a healthy window before trusting anything below.")
+        print("!" * 72 + "\n")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Per-ID grouping + bitfield extraction
 # ---------------------------------------------------------------------------
 
@@ -352,6 +453,226 @@ def extract_be(be_int: np.ndarray, payload_len: int, byte_off: int,
     return raw.astype(np.float64)
 
 
+def extract_be_bits(be_int: np.ndarray, payload_len: int, start_sawtooth: int,
+                    length: int) -> np.ndarray:
+    """ARBITRARY big-endian (Motorola) field: MSB at `start_sawtooth`, `length` bits.
+
+    `start_sawtooth` is the DBC/cantools Motorola convention - byte*8 + bit_in_byte,
+    where bit 7 is a byte's MSB - and the field then walks DOWN within the byte and
+    continues at bit 7 of the next byte.
+
+    Byte-aligned big-endian is not enough. Designers place Motorola fields at
+    arbitrary bit offsets with arbitrary lengths - packing several quantities into
+    one message leaves fields straddling byte boundaries as a matter of course. A
+    search that generates only byte-aligned, whole-byte big-endian candidates
+    cannot express such a field at all: it is unreachable, not merely low-ranked.
+    """
+    nbits = payload_len * 8
+    byte, bit = start_sawtooth // 8, start_sawtooth % 8
+    msb_index = byte * 8 + (7 - bit)          # index from the MSB of be_int
+    shift = nbits - (msb_index + length)
+    if shift < 0 or msb_index < 0:
+        return np.zeros(len(be_int), dtype=np.float64)
+    mask = (1 << length) - 1
+    raw = (be_int >> shift) & mask
+    return raw.astype(np.float64)
+
+
+def be_bit_indices(payload_len: int, start_sawtooth: int, length: int) -> list[int]:
+    """LSB-first global bit indices a Motorola field occupies, MSB first.
+
+    Lets big-endian candidates reuse the same per-bit activity guards the
+    little-endian path already applies (boundary bits must actually change).
+    """
+    out, pos = [], start_sawtooth
+    for _ in range(length):
+        byte, bit = pos // 8, pos % 8
+        if byte >= payload_len:
+            break
+        out.append(byte * 8 + bit)
+        pos = (byte + 1) * 8 + 7 if bit == 0 else pos - 1
+    return out
+
+
+def be_fits(payload_len: int, start_sawtooth: int, length: int) -> bool:
+    """True if a Motorola field at this start/length lies inside the payload."""
+    nbits = payload_len * 8
+    byte, bit = start_sawtooth // 8, start_sawtooth % 8
+    msb_index = byte * 8 + (7 - bit)
+    return 0 <= msb_index and msb_index + length <= nbits
+
+
+def field_candidates(payload_len: int, min_len: int = 1, max_len: int = 32,
+                     lengths=None, changing=None, both_orders: bool = True):
+    """Yield (order, start, length) over BOTH endiannesses at ARBITRARY offsets.
+
+    The single most important thing a bus-wide search can get wrong is to scan one
+    endianness, or to scan only byte-aligned offsets. Either restriction makes
+    whole classes of real field unreachable, and their absence from the results
+    then reads as absence from the bus. Both orders are common; some buses are
+    overwhelmingly one or the other, and you do not know which in advance. Use this
+    everywhere a scan enumerates fields, so the blind spot cannot be reintroduced
+    per-script.
+
+    `changing` (optional) is a boolean array of LSB-first bit activity; when given,
+    little-endian candidates are restricted to active boundary bits, which is the
+    existing guard against grabbing a constant flag or padding bit.
+    """
+    nbits = payload_len * 8
+    lens = list(lengths) if lengths is not None else list(range(min_len, max_len + 1))
+    for length in lens:
+        if length < 1 or length > nbits:
+            continue
+        for start in range(nbits):
+            if start + length <= nbits:
+                if changing is not None:
+                    end = start + length - 1
+                    if not (changing[start] and changing[end]):
+                        continue
+                yield ("little", start, length)
+        if not both_orders or length == 1:
+            continue                      # 1-bit fields are endianness-free
+        for start in range(nbits):
+            if be_fits(payload_len, start, length):
+                yield ("big", start, length)
+
+
+def extract_any(g: "IdGroup", order: str, start: int, length: int) -> np.ndarray:
+    """Extract by (order, start, length) using the conventions above."""
+    if order == "little":
+        return extract_le(g.le_int, start, length)
+    return extract_be_bits(g.be_int, g.length, start, length)
+
+
+def min_samples_for(g: "IdGroup", seconds: float, floor: int = 3) -> int:
+    """How many frames of THIS id to expect in `seconds` — a rate-aware threshold.
+
+    A fixed frame-count threshold silently excludes slow messages: at 1 Hz a 30 s
+    window holds only 30 frames, so a `>= 40` rule drops the ID entirely. Cycle
+    times on one bus routinely span three orders of magnitude (10 ms to 5 s), so
+    any constant threshold is wrong for most of them - and the IDs it discards are
+    exactly the slow, low-rate ones that carry status and body signals. Scale the
+    requirement by each message's own cycle time instead.
+    """
+    if g.n < 2:
+        return floor
+    dt = np.diff(np.sort(g.t))
+    dt = dt[dt > 0]
+    if len(dt) == 0:
+        return floor
+    cycle = float(np.median(dt))
+    if cycle <= 0:
+        return floor
+    return max(floor, int(0.5 * seconds / cycle))
+
+
+# ---------------------------------------------------------------------------
+# Value interpretations
+# ---------------------------------------------------------------------------
+#
+# Extracting the right BITS is only half the problem: the same bits mean
+# different numbers under different conventions, and a search that tries only
+# unsigned and two's-complement will silently miss anything else. These are the
+# encodings that appear across CAN buses generally; none is specific to a
+# manufacturer, and a designer is free to use any of them.
+#
+# An affine fit (scale, offset) already absorbs offset-binary/excess-K encodings
+# and inverted slopes, so those need no separate entry. What it CANNOT absorb is
+# a non-linear remapping of the raw integer - sign-magnitude, BCD and Gray code
+# all reorder the value space - so each needs its own interpretation.
+
+def interp_unsigned(raw: np.ndarray, length: int) -> np.ndarray:
+    return raw
+
+
+def interp_signed(raw: np.ndarray, length: int) -> np.ndarray:
+    """Two's complement."""
+    full = float(1 << length)
+    half = float(1 << (length - 1))
+    return np.where(raw >= half, raw - full, raw)
+
+
+def interp_sign_magnitude(raw: np.ndarray, length: int) -> np.ndarray:
+    """Top bit is the sign, remaining bits the magnitude.
+
+    Common on sensors that report a signed physical quantity from an inherently
+    unsigned measurement (angles, currents, torques).
+    """
+    if length < 2:
+        return raw
+    half = 1 << (length - 1)
+    mag = np.mod(raw, half)
+    return np.where(raw >= half, -mag, mag)
+
+
+def interp_complement(raw: np.ndarray, length: int) -> np.ndarray:
+    """Bitwise-inverted field (active-low encodings, some fault/status words)."""
+    mask = (1 << length) - 1
+    return np.bitwise_and(np.bitwise_not(raw.astype(np.int64)), mask).astype(np.float64)
+
+
+def interp_bcd(raw: np.ndarray, length: int) -> np.ndarray:
+    """Binary-coded decimal: each nibble is one decimal digit.
+
+    Turns up in odometers, clocks, VIN/serial fields and anything meant to be
+    displayed directly. Returns NaN where a nibble exceeds 9, so a field that is
+    not BCD scores as unusable rather than as plausible noise.
+    """
+    n = length // 4
+    if n < 1:
+        return np.full(len(raw), np.nan)
+    v = raw.astype(np.int64)
+    out = np.zeros(len(raw), dtype=np.float64)
+    bad = np.zeros(len(raw), dtype=bool)
+    for i in range(n):
+        digit = (v >> (4 * i)) & 0xF
+        bad |= digit > 9
+        out += digit.astype(np.float64) * (10.0 ** i)
+    out[bad] = np.nan
+    return out
+
+
+def interp_gray(raw: np.ndarray, length: int) -> np.ndarray:
+    """Gray code -> binary. Used by absolute position encoders and some switches,
+    where only one bit changes per step so no transient intermediate is possible."""
+    v = raw.astype(np.int64)
+    shift = 1
+    while shift < length:
+        v = v ^ (v >> shift)
+        shift <<= 1
+    return v.astype(np.float64)
+
+
+# Cheap and near-universal; always searched.
+INTERP_DEFAULT = ("unsigned", "signed")
+# The rest cost extra passes, so they are opt-in - but they are the difference
+# between "we did not find it" and "it is not there".
+INTERPRETATIONS = {
+    "unsigned": interp_unsigned,
+    "signed": interp_signed,
+    "sign_magnitude": interp_sign_magnitude,
+    "complement": interp_complement,
+    "bcd": interp_bcd,
+    "gray": interp_gray,
+}
+
+
+def resolve_interps(spec: str | None) -> list[str]:
+    """Parse an --interp spec: None/'default', 'all', or a comma-separated list."""
+    if not spec or spec == "default":
+        return list(INTERP_DEFAULT)
+    if spec == "all":
+        return list(INTERPRETATIONS)
+    out = []
+    for name in spec.split(","):
+        name = name.strip()
+        if name not in INTERPRETATIONS:
+            raise ValueError(f"unknown interpretation {name!r}; "
+                             f"choose from {sorted(INTERPRETATIONS)} / default / all")
+        out.append(name)
+    return out
+
+
 def apply_sign(raw: np.ndarray, length: int, signed: bool) -> np.ndarray:
     """Interpret raw as two's complement if signed (float-safe for length<=53)."""
     if not signed:
@@ -366,16 +687,23 @@ def extract_field(g: "IdGroup", order: str, signed: bool, byte: int | None = Non
                   length_bits: int | None = None) -> tuple[np.ndarray, int, int]:
     """Extract a field from a group → (raw float64 array, cantools_start, length_bits).
 
-    Give either byte+width (byte-aligned, little or big) or start_bit+length_bits
-    (Intel/little-only). Mirrors the cantools start-bit convention so the result
-    maps straight into make_single_signal_db.
+    Give either byte+width (byte-aligned, little or big) or start_bit+length_bits.
+    start_bit/length_bits works for BOTH orders — for Motorola, `start_bit` is the
+    sawtooth MSB index, matching the DBC convention. Restricting it to Intel made
+    arbitrary big-endian fields unexpressible, which is precisely the shape a
+    packed Motorola signal usually takes. Mirrors the cantools start-bit convention
+    so the result maps straight into make_single_signal_db.
     """
     if start_bit is not None and length_bits is not None:
-        if order != "little":
-            raise ValueError("start-bit/length-bits is Intel(little)-only; "
-                             "use byte/width for Motorola")
         length = length_bits
-        raw = extract_le(g.le_int, start_bit, length)
+        if order == "little":
+            raw = extract_le(g.le_int, start_bit, length)
+        else:
+            if not be_fits(g.length, start_bit, length):
+                raise ValueError(
+                    f"Motorola field start {start_bit} length {length} does not fit "
+                    f"in a {g.length}-byte payload")
+            raw = extract_be_bits(g.be_int, g.length, start_bit, length)
         ct_start = start_bit
     elif byte is not None and width is not None:
         length = width * 8
@@ -920,6 +1248,88 @@ def plausibility(raw_unsigned: np.ndarray, length: int,
 
 # "Nice" scales an OEM tends to pick: simple decimals m*10**k and binary
 # fractions 2**-j, across a wide exponent range (covers GPS 1e-7 .. counts 1).
+# ---------------------------------------------------------------------------
+# Unit families — for judging scale roundness in the signal's NATIVE unit
+# ---------------------------------------------------------------------------
+#
+# A fitted scale is judged "round" because a human chose it, but roundness only
+# shows up in the unit that human was working in. A signal designed as 0.01 mph
+# per count reads as 0.016093 km/h per count - identical signal, and the second
+# form looks like noise. If the reference happens to be in km/h, a correct decode
+# is then dismissed for looking untidy.
+#
+# Each family maps unit -> multiplier FROM the family's base unit. To convert a
+# scale expressed in unit A into unit B: scale_B = scale_A * (f[B] / f[A]).
+#
+# Only linear (ratio) conversions belong here. Temperature is listed as a DELTA
+# family because a per-count increment carries no offset - the 32 in F = 1.8C+32
+# lives in the signal's offset, not its scale. Reciprocal relationships such as
+# mpg vs L/100km are deliberately absent: they are not scale factors at all.
+UNIT_FAMILIES: dict[str, dict[str, float]] = {
+    "speed":        {"m/s": 1.0, "km/h": 3.6, "mph": 2.2369362920544,
+                     "kn": 1.9438444924406},
+    "distance":     {"m": 1.0, "km": 0.001, "mi": 1.0 / 1609.344, "ft": 3.280839895,
+                     "cm": 100.0},
+    "accel":        {"m/s^2": 1.0, "g": 1.0 / 9.80665},
+    "angle":        {"deg": 1.0, "rad": 0.01745329251994},
+    "angular_rate": {"deg/s": 1.0, "rad/s": 0.01745329251994, "rpm": 1.0 / 6.0},
+    "temp_delta":   {"C": 1.0, "K": 1.0, "F": 1.8},
+    "pressure":     {"kPa": 1.0, "bar": 0.01, "MPa": 0.001, "psi": 0.14503773773,
+                     "inHg": 0.29529987508, "mbar": 10.0},
+    "torque":       {"Nm": 1.0, "lbft": 0.73756214928},
+    "power":        {"kW": 1.0, "hp": 1.3410220896, "W": 1000.0},
+    "mass":         {"kg": 1.0, "lb": 2.2046226218, "g": 1000.0},
+    "volume":       {"L": 1.0, "gal": 0.26417205236, "mL": 1000.0},
+    "flow":         {"g/s": 1.0, "kg/h": 3.6, "lb/min": 0.13227735731},
+    "voltage":      {"V": 1.0, "mV": 1000.0},
+    "current":      {"A": 1.0, "mA": 1000.0},
+}
+
+_UNIT_ALIASES = {
+    "kph": "km/h", "km/hr": "km/h", "kmh": "km/h", "mps": "m/s",
+    "mi/h": "mph", "deg c": "C", "degc": "C", "°c": "C", "celsius": "C",
+    "deg f": "F", "degf": "F", "°f": "F", "fahrenheit": "F", "kelvin": "K",
+    "degree": "deg", "degrees": "deg", "°": "deg", "dps": "deg/s",
+    "deg/sec": "deg/s", "m/s2": "m/s^2", "m/s²": "m/s^2", "mss": "m/s^2",
+    "rev/min": "rpm", "r/min": "rpm", "volt": "V", "volts": "V", "amp": "A",
+    "amps": "A", "newton-metre": "Nm", "n·m": "Nm", "nm": "Nm",
+    "litre": "L", "liter": "L", "l": "L", "mile": "mi", "miles": "mi",
+}
+
+
+def normalise_unit(unit: str | None) -> str | None:
+    """Map a free-text unit onto a UNIT_FAMILIES key, or None if unrecognised."""
+    if not unit:
+        return None
+    u = unit.strip()
+    if not u:
+        return None
+    low = u.lower()
+    if low in _UNIT_ALIASES:
+        u = _UNIT_ALIASES[low]
+    for units in UNIT_FAMILIES.values():
+        for name in units:
+            if u == name or low == name.lower():
+                return name
+    return None
+
+
+def unit_siblings(unit: str | None) -> list[tuple[str, float]]:
+    """[(unit, factor)] converting a scale in `unit` into each sibling unit.
+
+    Returns just [(unit, 1.0)] when the unit is unknown or has no siblings, so
+    callers degrade to a single-unit check rather than to a guess.
+    """
+    u = normalise_unit(unit)
+    if u is None:
+        return []
+    for units in UNIT_FAMILIES.values():
+        if u in units:
+            base = units[u]
+            return [(name, f / base) for name, f in units.items()]
+    return []
+
+
 def scale_plausibility(scale: float, tol: float = 0.02) -> dict:
     """How close is |scale| to a 'nice' OEM value? -> {nice, nearest, rel_err}.
 
@@ -945,6 +1355,103 @@ def scale_plausibility(scale: float, tol: float = 0.02) -> dict:
     rel_err = abs(a - nearest) / nearest
     return {"nice": bool(rel_err <= tol), "nearest": nearest,
             "rel_err": round(float(rel_err), 4)}
+
+
+def scale_roundness(scale: float, ref_unit: str | None = None,
+                    tol: float = 0.02) -> dict:
+    """Is `scale` round in the reference unit, or in any SIBLING unit?
+
+    `scale_plausibility` asks "is this round?" in whatever unit the reference
+    happened to use. That dismisses a correct decode whenever the signal was
+    designed in a different unit from the one you measured in: 0.01 mph/count is
+    0.016093 km/h/count, which looks like nothing.
+
+    Testing more units costs statistical power, and the cost is real - the "nice"
+    grid is dense enough that a random scale lands within 2% of some candidate
+    roughly 1 time in 8, so trying twenty units would call almost anything round.
+    Two guards keep the check meaningful:
+
+      * only SIBLING units are tried - the 3-5 members of the reference's own
+        family, never an unrelated ratio - so the number of tests stays small and
+        each one is physically motivated;
+      * a sibling must clear a STRICTER tolerance (tol/2) than the reference unit
+        itself, so "round, but only after switching units" needs better evidence
+        than "round as measured".
+
+    Caveat worth carrying: the "nice" grid holds roughly seven candidates per
+    decade, so at the default 2% tolerance a random scale matches something about
+    one time in eight. A match at 1.9% is therefore weak evidence and a match at
+    0.1% is strong - always read `rel_err`, do not treat `nice` as a boolean fact.
+    A loose in-unit match can also mask a tighter sibling-unit one, because the
+    sibling search only runs when the reference unit fails outright.
+
+    Returns {nice, nearest, rel_err, unit, factor, switched, n_tested}. `unit` is
+    the unit in which the scale looks designed; `switched` marks that it is not
+    the unit you measured in - which is itself a useful finding, since it says the
+    signal is probably native to that other unit.
+    """
+    base = scale_plausibility(scale, tol=tol)
+    out = {**base, "unit": normalise_unit(ref_unit) or (ref_unit or ""),
+           "factor": 1.0, "switched": False, "n_tested": 1, "alternatives": []}
+
+    sibs = [(u, f) for u, f in unit_siblings(ref_unit) if abs(f - 1.0) > 1e-12]
+    if sibs:
+        out["n_tested"] = 1 + len(sibs)
+        # Always record sibling fits, even when the reference unit already matched.
+        # A LOOSE in-unit hit can hide a tighter one in another unit, and the
+        # operator should see both rather than have the tie silently broken.
+        alts = []
+        for u, f in sibs:
+            c = scale_plausibility(scale * f, tol=tol)
+            if c["nice"]:
+                alts.append({"unit": u, "factor": f, "scale": scale * f,
+                             "nearest": c["nearest"], "rel_err": c["rel_err"]})
+        out["alternatives"] = sorted(alts, key=lambda a: a["rel_err"])
+
+    if base["nice"]:
+        return out                      # round as measured; do not switch
+
+    if not sibs:
+        return out
+    strict = tol / 2.0
+    best = None
+    for u, f in sibs:
+        cand = scale_plausibility(scale * f, tol=strict)
+        if cand["nice"] and (best is None or cand["rel_err"] < best[0]["rel_err"]):
+            best = (cand, u, f)
+    if best is None:
+        return out
+    cand, u, f = best
+    return {**cand, "unit": u, "factor": f, "switched": True,
+            "n_tested": out["n_tested"], "alternatives": out["alternatives"]}
+
+
+def describe_scale_roundness(info: dict, scale: float) -> str:
+    """One-line human summary of a scale_roundness result."""
+    if not info.get("nice"):
+        return (f"scale {scale:.6g} is not a round value in "
+                f"{info.get('unit') or 'the reference unit'}"
+                + (f" nor in {info['n_tested'] - 1} sibling unit(s)"
+                   if info.get("n_tested", 1) > 1 else "")
+                + " - a non-round scale usually means the field geometry is wrong.")
+    if not info.get("switched"):
+        q = "exact" if info["rel_err"] < 0.002 else (
+            "close" if info["rel_err"] < 0.01 else "LOOSE")
+        msg = (f"scale {scale:.6g} ~ {info['nearest']:g} [round, "
+               f"{100 * info['rel_err']:.1f}% off - {q}]")
+        # a weak in-unit match may be hiding a better one in a sibling unit
+        alts = [a for a in info.get("alternatives", [])
+                if a["rel_err"] < info["rel_err"]]
+        if q != "exact" and alts:
+            a = alts[0]
+            msg += (f"; but it is also {a['scale']:.6g} {a['unit']} ~ "
+                    f"{a['nearest']:g} ({100 * a['rel_err']:.1f}% off) - AMBIGUOUS, "
+                    f"the native unit is not resolved by this reference")
+        return msg
+    return (f"scale {scale:.6g} is not round as measured, but equals "
+            f"{scale * info['factor']:.6g} {info['unit']} ~ {info['nearest']:g} "
+            f"({100 * info['rel_err']:.1f}% off) - the signal is probably native "
+            f"{info['unit']}, so prefer that unit and scale in the DBC.")
 
 
 # ---------------------------------------------------------------------------
