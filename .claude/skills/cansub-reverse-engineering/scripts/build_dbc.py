@@ -238,13 +238,32 @@ def main() -> int:
 
     phys = offset + scale * raw
 
-    # round-scale plausibility (warn, never block)
-    sp = common.scale_plausibility(scale)
+    # round-scale plausibility (warn, never block). Judged in the reference unit
+    # AND in that unit's siblings: a signal designed in mph reads as an untidy
+    # km/h scale, and dismissing it for that would throw away a correct decode.
+    sp = common.scale_roundness(scale, ref_unit=args.unit)
     if not sp["nice"]:
         print(f"  [!] scale {scale:.6g} is not a round OEM value (nearest "
-              f"{sp['nearest']:g}, {100 * sp['rel_err']:.0f}% off) - a non-round scale "
-              f"often means the field geometry is wrong (sub-slice / wrong endianness). "
-              f"Re-check bitsearch before trusting this.", file=sys.stderr)
+              f"{sp['nearest']:g}, {100 * sp['rel_err']:.0f}% off"
+              + (f"; also checked {sp['n_tested'] - 1} sibling unit(s)"
+                 if sp.get("n_tested", 1) > 1 else "")
+              + f") - a non-round scale often means the field geometry is wrong "
+              f"(sub-slice / wrong endianness). Re-check bitsearch before trusting "
+              f"this.", file=sys.stderr)
+    elif sp.get("switched"):
+        native = scale * sp["factor"]
+        print(f"  [!] scale {scale:.6g} {args.unit or ''} is not round, but it is "
+              f"{native:.6g} {sp['unit']} ~ {sp['nearest']:g} - the signal is very "
+              f"likely NATIVE {sp['unit']}. Prefer --unit {sp['unit']} --scale "
+              f"{sp['nearest']:g}; the geometry is probably right.", file=sys.stderr)
+    else:
+        # round as measured - but say so when a sibling unit fits BETTER, since a
+        # loose in-unit match can quietly hide the real native unit.
+        better = [a for a in sp.get("alternatives", [])
+                  if a["rel_err"] < sp["rel_err"]]
+        if better:
+            print(f"  [i] {common.describe_scale_roundness(sp, scale)}",
+                  file=sys.stderr)
     # moving-data residual distribution (not just a single R^2)
     if ref_at_frames is not None:
         rs = common.residual_summary(phys, ref_at_frames)

@@ -24,6 +24,13 @@ description: >
   Targets plain, non-multiplexed CAN signals. Ad-hoc input logs the user refers to
   by filename usually sit in the working-directory root (or under TEMP/) — glob for
   the named file there before asking where it is.
+  Also handles (4) CCAP - a capture bundle exported by the can-capture MOBILE APP,
+  a folder named ccap_<timestamp>_<vehicle>_<ulid>_r<n>/ containing can.csv, gps.csv,
+  annotations.json, video.mp4 and run.json per run. Trigger on phrasings like
+  "reverse engineer <signal> from my capture / from the app export / from the truck
+  run", or a path under captures/. Convert it with scripts/import_ccap.py FIRST -
+  it emits the trace and sidecars every other script expects, and prints a capture
+  health report that must be read before any result is trusted.
 ---
 
 # CANsub reverse engineering
@@ -130,6 +137,80 @@ immediately glob for it — check the **working-directory root first** (where us
 usually drop the file), then **`TEMP/` recursively** — rather than asking the user
 where it is. Only ask if the glob finds nothing or several plausible matches.
 
+## Search completeness — read before declaring a signal ABSENT
+
+A negative result means one of two very different things: the signal is not on the
+bus, or the search could not express it. Those are only distinguishable if the
+search space is complete. Nothing here is manufacturer-specific — a designer may
+use any of these encodings, and the searches must assume they will.
+
+**The search space has four independent axes.** Restricting any one of them makes a
+whole class of field *unreachable* — not low-ranked, but impossible to return:
+
+| axis | must cover |
+|---|---|
+| **byte order** | little-endian (Intel) **and** big-endian (Motorola) |
+| **bit offset** | every start bit, not only byte-aligned |
+| **length** | every width, not only whole bytes |
+| **interpretation** | how the raw integer maps to a number (below) |
+
+Use `common.field_candidates()` and `common.extract_any()` rather than reaching
+for `extract_le` directly — that is what keeps the blind spot from being
+reintroduced in each new scan.
+
+**Interpretations.** An affine fit (scale, offset) already absorbs offset-binary /
+excess-K encodings and inverted slopes, so those need no special handling. What it
+cannot absorb is a **non-linear remapping** of the raw integer. `common.INTERPRETATIONS`
+covers: `unsigned`, `signed` (two's complement), `sign_magnitude`, `complement`,
+`bcd` (displayed values — odometers, clocks), `gray` (position encoders, where only
+one bit may change per step). `bitsearch --interp all` searches them all; the
+default is unsigned + two's complement because they are much the most common.
+
+**Rate-aware thresholds.** Cycle times on one bus routinely span three orders of
+magnitude (10 ms to 5 s), so any constant frame-count minimum is wrong for most
+messages — and the ones it silently discards are the slow, low-rate IDs that carry
+status and body signals. A 1 Hz message yields ~30 frames in a 30 s window, so a
+`>= 40` rule drops it entirely. Use `common.min_samples_for(group, seconds)`.
+
+**A weak `correlate` result is NOT evidence of absence.** Byte-aligned triage
+under-ranks any ID whose signal sits at a non-byte offset. Before concluding a
+signal is not present: re-run with `--deep`, run `bitsearch.py` directly on every
+ID that could plausibly carry it, and try `--interp all`.
+
+**Scale roundness — and the unit trap.** A fitted scale is evidence about the
+geometry, because a human chose it and humans choose tidy values (0.01, 0.25, or a
+binary fraction like 1/32, which is a bit-shift and so costs nothing). A non-round
+scale usually means you have the wrong bits.
+
+But roundness only appears in the unit the designer worked in. A signal built as
+0.01 mph/count reads as 0.016093 km/h/count — identical signal, and the second form
+looks like noise. `common.scale_roundness(scale, ref_unit=...)` therefore checks the
+reference unit *and* its siblings (`UNIT_FAMILIES`), and reports which unit made it
+round: that is itself a finding, since it identifies the signal's native unit.
+
+Two disciplines keep this honest, and both matter:
+
+- **Only sibling units are tried**, never an arbitrary ratio, and a sibling must
+  clear a stricter tolerance than the reference unit. The "nice" grid holds ~7
+  candidates per decade, so at 2% tolerance a random scale matches something about
+  1 time in 8 — trying twenty unrelated ratios would call almost anything round.
+- **Read `rel_err`, not just `nice`.** A 0.1% match is strong evidence; a 1.9%
+  match is nearly meaningless. When a sibling unit fits *better* than the
+  reference unit, the result is reported as AMBIGUOUS rather than silently
+  resolved.
+
+A **biased reference** defeats this entirely: fit against something reading 3% off
+and the scale lands 3% from every round value, so no unit looks right. That is not
+a tool limitation to engineer around — it means the reference is not good enough to
+resolve the native unit, and you need a better one.
+
+**When two framings are near-collinear**, R² cannot separate them and a tie-break
+may pick the wrong one; scale roundness is the tie-break to reach for, subject to
+everything above.
+
+Run `python scripts/selftest_geometry.py` after touching any candidate generation,
+extraction, or interpretation code.
+
 ## Signal taxonomy → drives the workflow
 
 Classify the target along two axes (see `references/re-methodology.md`):
@@ -189,6 +270,54 @@ THAT as the reference instead (see the **Offline workflow**). It is machine-deco
 such a reference to exist; when none does (the common case for a proprietary
 signal), the live human reference (A) is your only option. Do NOT route a dynamic
 signal to the offline workflow by default just because it is dynamic.
+
+**C. ccap bundle (the mobile capture app) — FORK ADDITION.** When the user points
+at a `ccap_*` folder (or a `run-NNN/` inside one), the references are already
+recorded and no live capture is possible or needed. **Always start with:**
+
+```
+python scripts/import_ccap.py --run <path to run-NNN>
+```
+
+It converts `can.csv` to a webCAN trace and emits every reference the bundle
+supports, then prints a health report. Full format details, the column mapping and
+a worked example are in **`references/ccap-format.md`** — read it before touching a
+bundle. The short version:
+
+- **GPS speed** → `sidecar_gps_*.csv` (`kind=value`). Speed/wheel-speed reference,
+  *if the vehicle moved while the bus was healthy*.
+- **IMU** → `sidecar_imu_*.csv`, including a derived gravity-projected
+  `yaw_rate_dps`. Yaw rate is the natural reference for steering, but only while
+  the vehicle is moving.
+- **Annotations** → `sidecar_events_*.csv` (`kind=event`, for `--type discrete`)
+  **and** `sidecar_state_<family>_*.csv` (`kind=value` plus `kind=anchor`). The
+  state series is the important one: a press like `<family>-<state>` is a HELD
+  STATE, not a point event, so the importer reconstructs a sample-and-hold series
+  per button family. Treat it like a Holds run — `correlate --type continuous` then
+  `bitsearch`. Pass `--state-values` to order the states physically before fitting
+  scale/offset, and `--state-initial` to seed a state held before the first press.
+- **Cluster video** → `vision_reference.py` with the `--start-epoch` the importer
+  prints. An independent record of whatever the cluster displays, for the whole run.
+  Rotate the video first, and verify the OCR read rate before relying on it.
+
+All three are **off-bus**, so unlike the Offline workflow (B) there is no
+`--exclude-ids` to pass — the reference cannot self-match.
+
+**Read the health report before believing anything.** These are wireless captures
+and they fail by going *quiet*, not by going corrupt: the CSV still parses, every ID
+is still present, and `correlate` still returns a confident top candidate computed
+from the handful of frames that survived. `import_ccap.py` prints a rate profile and
+writes `health_<tag>.json`; `--auto-window` clips to the last sustained full-rate
+region. `correlate` / `bitsearch` / `verify` additionally print a DEGRADED CAPTURE
+banner, scoped to the span the reference actually covers. **When that banner
+appears, say so in your answer and re-run on a healthy window — do not report the
+candidate as if it were sound.**
+
+Note also that timestamp quality varies by app version. Check the importer's
+`frames per stamp` line: if frames share timestamps, they were stamped per read
+BATCH rather than per frame, and **`survey.py`'s `period`/`jit` columns are then
+artifacts** that must not be used to classify frames. With a monotonic per-frame
+timebase they are meaningful.
 
 **`--ref-window` is for the HOLDS run only.** Pass **`--ref-window <seconds>`** to
 `correlate` / `bitsearch` / `build_dbc` / `verify` (match the flask `--window`) so they

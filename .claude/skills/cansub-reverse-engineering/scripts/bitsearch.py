@@ -9,7 +9,9 @@ field with a transparent decision summary (which permutation won, and why).
   * little-endian: every start x every length in [min..max] bits, restricted to
     candidates whose BOUNDARY bits actually change - so we don't grab a constant
     valid-flag / padding bit and report a half-scale field,
-  * big-endian:    byte-aligned widths (the common Motorola continuous case),
+  * big-endian:    every start x every length too (packed Motorola fields routinely
+    sit off byte boundaries with non-byte widths; byte-aligned-only cannot
+    express them),
   * each scored signed AND unsigned.
 
 Ranking (overlapping candidates are clustered; the best representative is kept):
@@ -67,11 +69,21 @@ def _changing_bits(g) -> np.ndarray:
     return mask
 
 
-def _span(entry: dict) -> tuple[int, int]:
-    """Global (start_bit, length_bits) span of a candidate (LSB-first index)."""
+def _span(entry: dict, payload_len: int | None = None) -> tuple[int, int]:
+    """Global (start_bit, length_bits) span of a candidate (LSB-first index).
+
+    A Motorola field is contiguous in the big-endian integer but NOT in LSB-first
+    index space - start 35 length 12 occupies bits 32-35 and 40-47 - so its span
+    is taken from the actual occupied indices rather than assumed byte-aligned.
+    Used only for overlap suppression, where the enclosing extent is what matters.
+    """
     if entry["order"] == "little":
         return entry["start_bit"], entry["length"]
-    return entry["byte"] * 8, entry["length"]
+    plen = payload_len if payload_len is not None else entry.get("_plen", 8)
+    bits = common.be_bit_indices(plen, entry["start_bit"], entry["length"])
+    if not bits:
+        return entry["start_bit"], entry["length"]
+    return min(bits), max(bits) - min(bits) + 1
 
 
 def _rank_key(e: dict) -> tuple:
@@ -201,6 +213,12 @@ def main() -> int:
                     help="skip growing the winning field's LSB using transition data "
                          "(by default a holds-located field is refined to its true "
                          "resolution; see common.refine_field_resolution)")
+    ap.add_argument("--interp", default="default",
+                    help="value interpretations to try: 'default' (unsigned+two's "
+                         "complement), 'all', or a comma list from "
+                         "unsigned,signed,sign_magnitude,complement,bcd,gray. "
+                         "An affine fit already absorbs offset-binary and inverted "
+                         "slopes; these cover the NON-linear remappings it cannot.")
     ap.add_argument("--byte-align", action="store_true",
                     help="emit the byte/word-aligned field that ENCLOSES the exercised "
                          "field across constant bits (e.g. 3|10 -> 0|16), reproducing the "
@@ -219,6 +237,11 @@ def main() -> int:
         args.lag_refine = args.max_lag
 
     can_id = int(args.id, 0)
+    try:
+        interps = common.resolve_interps(args.interp)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     df = common.load_trace(args.trace)
     groups = common.group_by_id(df)
     if can_id not in groups:
@@ -229,6 +252,9 @@ def main() -> int:
     period_s = float(np.median(np.diff(g.t))) if g.n > 1 else 0.0
 
     sidecar = common.load_sidecar(args.sidecar)
+    # FORK: bitsearch is the authoritative stage - never let it speak first on a
+    # capture that lost most of its frames across the reference window.
+    common.warn_if_degraded(df, sidecar["epoch"].to_numpy(float))
     sampler = common.make_reference_sampler(
         sidecar, window=args.ref_window, guard=args.ref_guard)
     if sampler.windowed:
@@ -269,25 +295,37 @@ def main() -> int:
             end = start + length - 1
             if end < nbits and changing[end]:
                 candidates.append(("little", start, length))
-    for byte in range(g.length):
-        for width in range(1, min(4, g.length - byte) + 1):
-            if args.min_len <= width * 8 <= args.max_len:   # honour the length bounds
-                candidates.append(("big", byte, width))
+    # Big-endian at ARBITRARY start bits and lengths, not just byte-aligned whole
+    # bytes. Motorola fields routinely sit off byte boundaries with non-byte
+    # widths, so a byte-aligned-only sweep cannot express them at all - such a
+    # field is not merely ranked low, it is unreachable. Boundary bits must be
+    # active, same guard as the little-endian side.
+    for length in range(max(args.min_len, 2), args.max_len + 1):
+        for start in range(nbits):
+            if not common.be_fits(g.length, start, length):
+                continue
+            bits = common.be_bit_indices(g.length, start, length)
+            if not (changing[bits[0]] and changing[bits[-1]]):
+                continue
+            candidates.append(("big", start, length))
 
     results = []
     for order, a, b in candidates:
         if order == "little":
             raw = common.extract_le(g.le_int, a, b)
-            length = b
         else:
-            raw = common.extract_be(g.be_int, g.length, a, b)
-            length = b * 8
+            raw = common.extract_be_bits(g.be_int, g.length, a, b)
+        length = b
         if np.ptp(raw) == 0:
             continue
-        for signed in (False, True):
-            rr = common.apply_sign(raw, length, signed)
-            if signed and np.array_equal(rr, raw):
-                continue
+        for interp in interps:
+            rr = common.INTERPRETATIONS[interp](raw, length)
+            if interp != "unsigned" and np.array_equal(
+                    np.nan_to_num(rr, nan=-1e30), np.nan_to_num(raw, nan=-1e30)):
+                continue                      # identical to the unsigned reading
+            if not np.any(np.isfinite(rr)) or np.ptp(rr[np.isfinite(rr)]) == 0:
+                continue                      # e.g. BCD on a non-BCD field
+            signed = interp == "signed"
             # Auto-mask high-confidence sentinels BEFORE scoring so a far-out
             # "signal invalid" code can't wreck this candidate's linear R^2 (the
             # metric that decides the winner). Masking only fires at high
@@ -305,9 +343,10 @@ def main() -> int:
             ref_at = sampler(g.t, best_lag)
             scale, offset, r2 = _fit_line(rr_fit, ref_at)
             plaus = plausibility(rr_fit[np.isfinite(rr_fit)], length, period_s)
-            byte_aligned = (a % 8 == 0) if order == "little" else True
+            byte_aligned = (a % 8 == 0) if order == "little" else (a % 8 == 7)
             entry = {
                 "id_hex": f"{can_id:X}", "order": order, "signed": signed,
+                "interp": interp, "_plen": g.length,
                 "length": length, "r2": round(r2, 4), "plaus": plaus["score"],
                 "wrap_rate": plaus["wrap_rate"], "spear": round(mag, 4),
                 "corr_sign": sign, "scale": round(scale, 8),
@@ -317,10 +356,9 @@ def main() -> int:
                 "tidy": int(byte_aligned) + int(length % 8 == 0)
                 + int(length in (8, 16, 24, 32)),
             }
-            if order == "little":
-                entry.update({"start_bit": a, "byte": a // 8, "bit_in_byte": a % 8})
-            else:
-                entry.update({"byte": a, "width": b, "start_bit": a * 8 + 7})
+            entry.update({"start_bit": a, "byte": a // 8, "bit_in_byte": a % 8})
+            if order == "big" and a % 8 == 7 and b % 8 == 0:
+                entry.update({"width": b // 8})   # byte-aligned Motorola convenience
             results.append(entry)
 
     if not results:
@@ -470,7 +508,7 @@ def main() -> int:
     if w["order"] == "little":
         wraw = common.extract_le(g.le_int, w["start_bit"], w["length"])
     else:
-        wraw = common.extract_be(g.be_int, g.length, w["byte"], w["width"])
+        wraw = common.extract_be_bits(g.be_int, g.length, w["start_bit"], w["length"])
     wraw = common.apply_sign(wraw, w["length"], w["signed"])
     wx = common.detect_extreme_outliers(wraw, w["length"], t=g.t)
     if wx:
@@ -487,8 +525,9 @@ def main() -> int:
         print(f"Best (Intel): start_bit {w['start_bit']} length {w['length']} "
               f"R^2 {w['r2']} plaus {w['plaus']}")
     else:
-        geom = f"--order big --byte {w['byte']} --width {w['width']}"
-        print(f"Best (Motorola): byte {w['byte']} width {w['width']} "
+        geom = (f"--order big --start-bit {w['start_bit']} "
+                f"--length-bits {w['length']}")
+        print(f"Best (Motorola): start_bit {w['start_bit']} length {w['length']} "
               f"R^2 {w['r2']} plaus {w['plaus']}")
     print(f"Next: build_dbc.py --id 0x{w['id_hex']} {geom} --lag {w['lag_s']}{sgn} "
           f"--trace {args.trace} --sidecar {args.sidecar} --name MySignal")

@@ -36,16 +36,36 @@ from common import (GRID_HZ, LAG_WINDOW_S, LAG_STEPS, N_WINDOWS,  # noqa: F401
 # Continuous
 # ---------------------------------------------------------------------------
 
-def _candidate_fields(group, max_width=2):
-    """Yield (byte, width, order) byte-aligned candidates for a group."""
+def _candidate_fields(group, max_width=2, deep=False, deep_lengths=(8, 10, 12, 16)):
+    """Yield (start_bit, length_bits, order) candidates for a group.
+
+    Default is the fast BYTE-ALIGNED triage: cheap enough to sweep the whole bus.
+    Its limitation is real. A packed field at a non-byte offset is not expressible
+    as any byte-aligned candidate, so the ID carrying it gets under-ranked and
+    never reaches bitsearch. A weak correlate result is therefore NOT evidence a
+    signal is absent.
+
+    `deep=True` enumerates every start bit in both orders over `deep_lengths`,
+    which is ~20x the work but can express those fields. Use it before concluding
+    a signal is not on the bus.
+    """
     L = group.length
-    for b in range(L):
-        # width 1: endianness irrelevant -> emit once as 'little'
-        yield (b, 1, "little")
-        for w in range(2, max_width + 1):
-            if b + w <= L:
-                yield (b, w, "little")
-                yield (b, w, "big")
+    nbits = L * 8
+    if not deep:
+        for b in range(L):
+            # width 1: endianness irrelevant -> emit once as 'little'
+            yield (b * 8, 8, "little")
+            for w in range(2, max_width + 1):
+                if b + w <= L:
+                    yield (b * 8, w * 8, "little")
+                    yield (b * 8 + 7, w * 8, "big")
+        return
+    for length in deep_lengths:
+        for start in range(nbits):
+            if start + length <= nbits:
+                yield (start, length, "little")
+            if common.be_fits(L, start, length):
+                yield (start, length, "big")
 
 
 def flagged_bytes(trace_path: str) -> dict:
@@ -71,7 +91,7 @@ def flagged_bytes(trace_path: str) -> dict:
     return out
 
 
-def correlate_continuous(df, sidecar, ids, max_width, top, flagged=None, exclude=None,
+def correlate_continuous(df, sidecar, ids, max_width, top, flagged=None, exclude=None, deep=False,
                          ref_window=None, ref_guard=0.0, max_lag=LAG_WINDOW_S):
     groups = common.group_by_id(df)
     if ids:
@@ -122,20 +142,21 @@ def correlate_continuous(df, sidecar, ids, max_width, top, flagged=None, exclude
     results = []
     for can_id, g in groups.items():
         bad = flagged.get(can_id, ())
-        for byte, width, order in _candidate_fields(g, max_width):
+        for start, length, order in _candidate_fields(g, max_width, deep=deep):
+            byte, width = start // 8, max(1, length // 8)
             if bad and any((byte + k) in bad for k in range(width)):
                 skipped += 1  # field overlaps a counter byte
                 continue
             if order == "little":
-                raw = common.extract_le(g.le_int, byte * 8, width * 8)
+                raw = common.extract_le(g.le_int, start, length)
             else:
-                raw = common.extract_be(g.be_int, g.length, byte, width)
+                raw = common.extract_be_bits(g.be_int, g.length, start, length)
             if np.ptp(raw) == 0:
                 continue  # static field, cannot encode a varying signal
             # auto-mask high-confidence sentinels before scoring (same agnostic
             # detector as bitsearch); high-confidence + <=15% only, so a wrong
             # byte's diffuse scatter is never masked away.
-            raw_fit, _ = common.auto_mask_outliers(raw, width * 8, t=g.t)
+            raw_fit, _ = common.auto_mask_outliers(raw, length, t=g.t)
             sig_grid = common.sample_hold(g.t, raw_fit, grid)
 
             # lag search: shift the reference sampling, keep best window-median rho
@@ -149,8 +170,8 @@ def correlate_continuous(df, sidecar, ids, max_width, top, flagged=None, exclude
 
             # signedness: re-score signed interpretation, keep better
             signed = False
-            raw_s = common.apply_sign(raw, width * 8, True)
-            raw_s_fit, _ = common.auto_mask_outliers(raw_s, width * 8, t=g.t)
+            raw_s = common.apply_sign(raw, length, True)
+            raw_s_fit, _ = common.auto_mask_outliers(raw_s, length, t=g.t)
             if not np.array_equal(raw_s, raw) and np.ptp(raw_s) > 0:
                 sig_s = common.sample_hold(g.t, raw_s_fit, grid)
                 ref_grid = sampler(grid, best_lag)
@@ -161,17 +182,18 @@ def correlate_continuous(df, sidecar, ids, max_width, top, flagged=None, exclude
             # chosen read. R^2 is scale-AWARE (Spearman is monotonic/scale-free), so it
             # orders the Spearman-tied shortlist: a coarse or wrong-scale slice that only
             # MOVES with the signal scores ~1.0 on Spearman but lower on R^2, so it can no
-            # longer top genuine carriers on plausibility alone (the 0x1C4-vs-0x3E9 trap).
+            # longer top genuine carriers on plausibility alone (the co-varying-carriers trap).
             chosen = raw_s_fit if signed else raw_fit
             chosen_grid = common.sample_hold(g.t, chosen, grid)
             ref_best = sampler(grid, best_lag)
             _, corr_sign = _windowed_spearman_signed(ref_best, chosen_grid, N_WINDOWS)
-            plaus = plausibility(chosen[np.isfinite(chosen)], width * 8)["score"]
+            plaus = plausibility(chosen[np.isfinite(chosen)], length)["score"]
             r2 = common.linear_fit_r2(chosen_grid, ref_best)[2]
             coverage = float(np.mean(np.isfinite(sampler(grid, 0.0))))
             results.append({
                 "id": can_id, "id_hex": f"{can_id:X}", "byte": byte,
                 "width": width, "order": order, "signed": signed,
+                "start_bit": start, "length": length,
                 "score": round(best, 4), "r2": round(r2, 4), "plaus": plaus,
                 "corr_sign": corr_sign, "lag_s": round(best_lag, 3),
                 "coverage": round(coverage, 2), "n": g.n,
@@ -252,6 +274,11 @@ def main() -> int:
                     "reference source IDs from decode_reference.py (0x7E8) so the search "
                     "can't self-match")
     ap.add_argument("--max-width", type=int, default=2, help="continuous: max bytes")
+    ap.add_argument("--deep", action="store_true",
+                    help="scan EVERY start bit in BOTH endiannesses (lengths 8/10/12/16) "
+                         "instead of byte-aligned only. ~20x slower, but byte-aligned "
+                         "triage cannot express a field at a non-byte offset. Use "
+                         "before concluding a signal is absent from the bus.")
     ap.add_argument("--max-lag", type=float, default=LAG_WINDOW_S,
                     help=f"continuous: +/- lag search half-window (s) to absorb "
                          f"reference<->trace skew (default {LAG_WINDOW_S:g}). Use ~0.2 for a "
@@ -275,17 +302,21 @@ def main() -> int:
 
     df = common.load_trace(args.trace)
     sidecar = common.load_sidecar(args.sidecar)
+    # FORK: a collapsed capture still ranks candidates confidently - say so first.
+    common.warn_if_degraded(df, sidecar["epoch"].to_numpy(float))
     ids = [int(x, 0) for x in args.ids.split(",")] if args.ids else None
     exclude = {int(x, 0) for x in args.exclude_ids.split(",")} if args.exclude_ids else None
     flagged = {} if args.no_skip_flagged else flagged_bytes(args.trace)
 
     if args.type == "continuous":
         results = correlate_continuous(df, sidecar, ids, args.max_width, args.top,
-                                       flagged, exclude,
+                                       flagged, exclude, deep=args.deep,
                                        ref_window=args.ref_window, ref_guard=args.ref_guard,
                                        max_lag=args.max_lag)
-        cols = ("id_hex", "byte", "width", "order", "signed", "score", "r2", "plaus",
-                "lag_s", "coverage")
+        # start_bit/length, not byte/width: in --deep mode byte/width cannot
+        # distinguish candidates and the table prints duplicate-looking rows.
+        cols = ("id_hex", "start_bit", "length", "order", "signed", "score", "r2",
+                "plaus", "lag_s", "coverage")
     else:
         results = correlate_discrete(df, sidecar, ids, args.window, args.top,
                                      flagged, exclude)
@@ -333,10 +364,17 @@ def main() -> int:
                   f"- any is valid) OR a reference too sparse to separate them (stepped "
                   f"holds - use a continuous SWEEP run). CONFIRM the top-R^2 carriers with "
                   f"bitsearch.")
-        print(f"\nBest: ID 0x{b['id_hex']} byte {b['byte']} width {b['width']} "
-              f"{b['order']}-endian signed={b['signed']} (score {b['score']}, "
-              f"lag {b['lag_s']}s)\nNext: build_dbc.py --id 0x{b['id_hex']} "
-              f"--byte {b['byte']} --width {b['width']} --order {b['order']} "
+        # report the EXACT geometry: in --deep mode byte/width cannot express it
+        aligned = (b["start_bit"] % 8 == 0 if b["order"] == "little"
+                   else b["start_bit"] % 8 == 7) and b["length"] % 8 == 0
+        geom = (f"--byte {b['byte']} --width {b['width']} --order {b['order']}"
+                if aligned else
+                f"--order {b['order']} --start-bit {b['start_bit']} "
+                f"--length-bits {b['length']}")
+        print(f"\nBest: ID 0x{b['id_hex']} start_bit {b['start_bit']} "
+              f"length {b['length']} {b['order']}-endian signed={b['signed']} "
+              f"(score {b['score']}, lag {b['lag_s']}s)\n"
+              f"Next: build_dbc.py --id 0x{b['id_hex']} {geom} "
               f"--lag {b['lag_s']}" + (" --signed" if b['signed'] else ""))
     return 0
 

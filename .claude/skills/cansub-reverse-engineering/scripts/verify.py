@@ -208,6 +208,9 @@ def main() -> int:
     best_lag = 0.0
     if args.sidecar:
         sidecar = common.load_sidecar(args.sidecar)
+        # FORK: this stage emits the PASS/UNCONFIRMED verdict a pipeline gates on,
+        # so the capture-quality caveat has to travel with it.
+        common.warn_if_degraded(df, sidecar["epoch"].to_numpy(float))
         sampler = common.make_reference_sampler(
             sidecar, window=args.ref_window, guard=args.ref_guard)
         if not sampler.windowed:
