@@ -96,6 +96,32 @@ this combined DBC in [webCAN](https://www.csselectronics.com/pages/webcan-can-bu
 and stream live from your CANsub to see your reverse-engineered signals decoded in
 real time - a final, live confirmation of the results.
 
+## This is a fork
+
+Forked from [CSS-Electronics/can-bus-reverse-engineering-skills](https://github.com/CSS-Electronics/can-bus-reverse-engineering-skills).
+Upstream's design is unchanged; the additions are:
+
+- **`import_ccap.py`** — read capture bundles from a mobile capture app (CAN + GPS +
+  IMU + operator annotations + cluster video sharing one clock) and emit the trace
+  and sidecars the existing pipeline already speaks, plus a capture-health report.
+- **`structure.py`** — prove out rolling counters, checksums and multiplexors before
+  searching for signals. They are the largest source of false positives.
+- **`segments.py`** — identify HELD CATEGORICAL states (gear, drive mode, wiper
+  setting). Correlation fits a line and cannot express an arbitrary code point.
+- **`coverage.py`** — measure how much of a bus you have actually decoded, against
+  the bits that are ACTIVE rather than all payload bits.
+- **`score_run.py`** — score a decoded DBC set against a reference set, so progress
+  is measurable rather than a judgement call.
+- **`selftest_geometry.py`** — guard the search-space contract.
+- Search completeness in `bitsearch`/`correlate`/`segments`: **both endiannesses at
+  arbitrary bit offsets and lengths** (a byte-aligned or single-endianness sweep
+  cannot express many real Motorola fields), **rate-aware sample thresholds** (a
+  fixed frame count silently drops slow IDs), **non-linear value interpretations**
+  (sign-magnitude, BCD, Gray, complement), and **unit-aware scale roundness** (a
+  scale designed in one unit looks untidy when measured in another).
+
+No vehicle-specific data is included — the skill is intended to work on any bus.
+
 ## License and attribution
 
 These skills are fully open source under the [MIT License](LICENSE) - you are free to use, modify and distribute them in your own projects.
