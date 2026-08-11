@@ -117,6 +117,21 @@ Two limits worth stating up front, both learned the hard way:
   capture-quality problems, not analysis problems, and the tooling reports them
   rather than papering over them.
 
+### Working on this fork
+
+Contributor-facing notes on how and why this fork is built the way it is:
+
+| doc | what it covers |
+|---|---|
+| [`CLAUDE.md`](CLAUDE.md) | operating rules for changing this repo — the leak rules, layout, and the checklist for adding a script |
+| [`docs/DESIGN-PRINCIPLES.md`](docs/DESIGN-PRINCIPLES.md) | why the additions look the way they do: confident wrong output as the enemy, search-space completeness, how each reference type lies |
+| [`docs/SANITIZATION.md`](docs/SANITIZATION.md) | keeping vehicle- and run-specific data out of a public, reusable skill |
+| [`docs/BLIND-TEST.md`](docs/BLIND-TEST.md) | measuring honestly whether a change improved results |
+
+The recurring constraint: this skill must carry **mechanism, never answers**.
+Anything specific to one vehicle or one capture biases the next run and makes
+improvement unmeasurable, so it is deliberately kept out of the repo.
+
 ## Recommended hardware
 
 - A [CANsub.2](https://www.csselectronics.com/products/can-fd-usb-interface-ethernet-cansub-2) CAN FD interface with USB/Ethernet
