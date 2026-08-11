@@ -15,3 +15,5 @@ flask>=3.0
 rapidocr>=2
 onnxruntime>=1.17
 opencv-python>=4.9
+# audio annotations (transcribe_audio) only; also needs ffmpeg on PATH:
+faster-whisper>=1.1

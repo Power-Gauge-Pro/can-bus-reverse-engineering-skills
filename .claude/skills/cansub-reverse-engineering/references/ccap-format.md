@@ -161,6 +161,44 @@ ffmpeg -v error -ss <t> -i video.mp4 -frames:v 1 \
 Re-check the crop across the run rather than assuming one region holds: if the
 mount shifts, a fixed region will drift off the target.
 
+**Spoken narration** — if the video has an audio track, an operator who talked
+through the run recorded annotations that a button press cannot match: speech is
+hands-free, so it can be given while driving, and it lands closer to the event.
+
+`transcribe_audio.py` extracts the audio, transcribes it locally, and writes both a
+readable transcript and an events sidecar on the same clock as everything else
+(pass `--start-epoch` from `run.video.started_utc`, exactly as for the video).
+
+```bash
+python scripts/transcribe_audio.py --video <run>/video.mp4 \
+    --start-epoch <run.video.started_utc> --label narration
+```
+
+**Speech recognition invents text on non-speech audio.** This is the failure mode
+that matters, and it is not rare: engine and road noise reliably produce confident,
+fluent, entirely fabricated sentences — most notoriously stock phrases absorbed
+from training data ("Thanks for watching", "Subscribe"). A fabricated annotation is
+worse than a missing one, because it *will* correlate with something and the result
+gets believed.
+
+So the script gates hard by default — voice-activity detection, the model's own
+no-speech probability, average token log-probability, and a blocklist for the stock
+phrases (which are fluent enough to pass the numeric checks). It reports every
+rejection. **On a run where nobody spoke, the correct output is zero events**, and
+seeing that is the point; do not relax the thresholds to manufacture annotations.
+
+Two further cautions once you do have a transcript:
+
+- **Read it before using it.** In-cabin audio is noisy and homophones are common
+  ("braking" → "breaking"), so a `--map` pattern must be tolerant or it drops the
+  event silently. The script lists accepted segments that matched no pattern.
+- **Speech is a human reference**, so it carries the same reaction lag as a button
+  press, in the same direction: the words TRAIL the event. Keep the lag search on,
+  and treat a bus transition that *follows* its narration as suspicious.
+
+`--words` emits one event per word instead of per segment, which times a cue more
+precisely — a spoken cue lands on its final word, not on the start of the sentence.
+
 **IMU** (`imu.csv`) → `sidecar_imu_<channel>_*.csv`. LONG format: one row per
 sample with a `sensor` column selecting which triple is populated.
 

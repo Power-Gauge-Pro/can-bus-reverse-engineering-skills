@@ -331,8 +331,16 @@ bundle. The short version:
 - **Cluster video** → `vision_reference.py` with the `--start-epoch` the importer
   prints. An independent record of whatever the cluster displays, for the whole run.
   Rotate the video first, and verify the OCR read rate before relying on it.
+- **Spoken narration** (the video's audio track) → `transcribe_audio.py`, same
+  `--start-epoch`. An operator who talks through the run annotates hands-free and
+  closer to the event than a button press allows. **Recognition INVENTS fluent text
+  on non-speech audio**, so the script gates on voice activity, no-speech
+  probability, log-probability and a stock-phrase blocklist, and reports every
+  rejection. On a run where nobody spoke the correct output is zero events — do not
+  relax thresholds to manufacture annotations. Speech carries reaction lag like any
+  human reference: the words trail the event.
 
-All three are **off-bus**, so unlike the Offline workflow (B) there is no
+All of these are **off-bus**, so unlike the Offline workflow (B) there is no
 `--exclude-ids` to pass — the reference cannot self-match.
 
 **Read the health report before believing anything.** These are wireless captures
@@ -1151,6 +1159,21 @@ is unchanged.
   per-frame glitches). The PNG/metrics are a preview, not a substitute; that interactive
   visual check is the gate. Numeric/digital readouts only (no analog needle gauges). Needs
   `rapidocr` + `onnxruntime` + `opencv-python` (in `requirements.txt`).
+- **Audio annotations (`transcribe_audio.py`).** FORK ADDITION. Transcribes spoken
+  operator narration from a capture's video into timestamped events on the shared
+  clock (`--start-epoch`, as for the vision reference), writing both a readable
+  transcript and a `kind=event` sidecar. `--words` times a cue to its final word
+  rather than the sentence start; `--map '{"regex":"label"}'` promotes matched
+  phrases to their own labels. **The defaults are strict on purpose**: recognition
+  does not return silence on non-speech audio, it returns confident fabricated
+  sentences, so voice-activity detection, no-speech probability, average
+  log-probability and a stock-phrase blocklist all gate the output, and every
+  rejection is reported. **Zero events on an unnarrated run is the correct result,
+  not a tuning failure** — a fabricated annotation correlates with something and
+  gets believed, which is strictly worse than none. Read the transcript before
+  relying on it (homophones are common, so `--map` patterns must be tolerant; the
+  script lists accepted segments that matched none). Needs `faster-whisper` (in
+  `requirements.txt`, no PyTorch) and `ffmpeg` on PATH.
 - Reference material: `references/re-methodology.md` (the manual method this
   automates, plus the gate / multi-run discipline) and
   `references/signal-encoding.md` (bit order, sign, scale/offset, bit-packing,

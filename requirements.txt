@@ -30,3 +30,9 @@ requests>=2.30
 rapidocr>=2
 onnxruntime>=1.17
 opencv-python>=4.9
+
+# --- audio annotations (transcribe_audio): transcribe spoken operator narration
+#     from the capture's video into timestamped annotations. Local + open source,
+#     no PyTorch (CTranslate2 backend); the model downloads on first use.
+#     Needs `ffmpeg` on PATH to extract the audio track. ---
+faster-whisper>=1.1

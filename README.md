@@ -43,6 +43,7 @@ Nothing here is vehicle- or manufacturer-specific, and no vehicle data is includ
 | **`structure.py`** | Proves out rolling counters, checksums and multiplexors: a counter must actually increment by a fixed step, a checksum must actually reproduce from the other bytes. Handles **sub-byte** counters. | These are the largest source of false positives. A counter correlates with any monotone reference and passes "does it ramp smoothly" tests *because* it takes small even steps. `survey.py` flags per byte, so a counter sharing a byte with data is invisible to it. |
 | **`segments.py`** | Finds **held categorical states** (gear, drive mode, wiper setting) by constant-within-hold plus one-to-one across holds. | `correlate` fits a line, and a categorical code point has no line to fit. Its `--type discrete` scores bits that flip *at* an event, but a held state is constant *between* them. |
 | **`coverage.py`** | Measures how much of a bus is decoded, against bits that are **ACTIVE** rather than all payload bits, counting counters/checksums separately. | RE has no natural finish line. A bit that never moves carries nothing the capture could have taught you, and plumbing shouldn't flatter the headline. |
+| **`transcribe_audio.py`** | Transcribes spoken operator narration from the capture's video into timestamped annotations on the shared clock, running locally (no PyTorch, no cloud). Gates hard on voice activity, no-speech probability, log-probability and a stock-phrase blocklist, and reports every rejection. | Narrating a run is hands-free, so it works while driving and lands closer to the event than reaching for a button. But **speech recognition does not return silence on non-speech audio — it invents fluent, confident sentences**, reliably including stock phrases from its training data. An unguarded transcript of a quiet run yields fabricated annotations that *will* correlate with something and be believed, which is strictly worse than none. Zero events on an unnarrated run is the correct output. |
 | **`score_run.py`** | Scores a decoded DBC set against a reference set: exact / partial / unmatched / novel. | The **partial** class is the point: a field sharing only the dominant byte decodes to nearly the right values with the wrong geometry. It passes correlation, passes the verify gate, and reads as a win in any results table. |
 | **`selftest_geometry.py`** | Pins the search-space contract. | So the fixes below cannot silently regress. |
 
@@ -91,8 +92,10 @@ without a laptop:
   ELM/STN adapter such as the **OBDLink MX+**, plugged into the OBD2 port. The
   format itself is adapter-agnostic; `run.json` simply records which was used.
 - **Phone** — an iPhone records the bus alongside **GPS**, the **IMU**
-  (accelerometer + gyroscope), operator **annotations**, and **video** of the
-  instrument cluster, all on one clock.
+  (accelerometer + gyroscope), operator **annotations**, and **video with audio** of
+  the instrument cluster, all on one clock. The audio matters: narrating a step is
+  hands-free, so it works while driving and lands closer to the event than reaching
+  for a button.
 - **Guided experiments** — the app walks the operator through a scripted sequence
   (ignition, gear positions, a steering sweep, a drive with speed holds, braking,
   turns), prompting each step and timestamping the button presses. Those presses
@@ -101,7 +104,7 @@ without a laptop:
 The point of the extra sensors is that **the hard part of reverse engineering is
 usually the reference, not the search**. A recorded drive gives several independent
 ones at once — GPS speed, IMU yaw rate, the cluster's own displayed values, and the
-operator's markers — so a candidate field can be cross-checked rather than merely
+operator's markers and narration — so a candidate field can be cross-checked rather than merely
 correlated.
 
 Two limits worth stating up front, both learned the hard way:

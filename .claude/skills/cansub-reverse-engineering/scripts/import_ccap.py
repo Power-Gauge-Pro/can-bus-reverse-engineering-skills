@@ -633,6 +633,10 @@ def main() -> int:
         print(f"          vision_reference.py --video {vid} --start-epoch {ep:.3f}")
         print(f"          (portrait file, landscape cluster - pre-rotate first, "
               f"see references/ccap-format.md)")
+        if run.get("video", {}).get("has_audio"):
+            print(f"          transcribe_audio.py --video {vid} --start-epoch {ep:.3f}")
+            print(f"          (spoken narration -> events; expect ZERO if nobody "
+                  f"talked, and do not relax its thresholds to get some)")
     return 0
 
 
