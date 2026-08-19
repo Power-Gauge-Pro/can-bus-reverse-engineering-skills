@@ -71,6 +71,8 @@ Open the Claude Code panel in VS Code and ask, for example:
 
 **Note:** You can use our [CANsub CAN+OBD2 sample data](https://www.csselectronics.com/pages/ai-can-bus-sniffer-data-pack) to test the skill
 
+**Note:** You should NOT attach a CSV as an attachment to Claude - it'll attempt to load possibly millions of raw CAN frames into the context window. Instead reference the CSV file path
+
 
 ## Output structure and combining DBCs
 
