@@ -2467,7 +2467,7 @@ def plot_bitsearch_grid(out_path, results, can_id, *, winner=None,
            "little-endian (Intel)")
     _panel(fig.add_subplot(gs[0, 1]),
            [r for r in results if r["order"] == "big"],
-           "byte", "width", "start byte", "width (bytes)", "big-endian (Motorola)")
+           "byte", "length", "start byte", "length (bits)", "big-endian (Motorola)")
 
     # parsimony knee: R^2 vs field length within the WINNER's nested family (same
     # start, growing width). The true width is the knee - R^2 jumps when the

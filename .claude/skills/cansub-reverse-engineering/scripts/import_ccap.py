@@ -66,7 +66,7 @@ def load_run(run_dir: str) -> dict:
 # ---------------------------------------------------------------- CAN -> trace
 
 def convert_can(run_dir: str, t0: float, start: float | None,
-                end: float | None) -> tuple[pd.DataFrame, dict]:
+                end: float | None, timebase: str = "auto") -> tuple[pd.DataFrame, dict]:
     """Read ccap can.csv and return (webCAN-shaped DataFrame, health stats)."""
     src = pd.read_csv(os.path.join(run_dir, "can.csv"), dtype=str).fillna("")
     need = {"utc", "bus", "id_hex", "ide", "rtr", "err", "dlc", "len", "dir",
@@ -84,10 +84,18 @@ def convert_can(run_dir: str, t0: float, start: float | None,
     # t_mono_us cannot step, so rebuild the timeline from it and re-anchor to wall
     # time with the MEDIAN offset - that keeps cross-source alignment with GPS,
     # annotations and video while discarding the step.
-    if "t_mono_us" in src.columns:
+    # A broken app build can emit t_mono_us as a constant (all zeros). A clock
+    # with one distinct value carries no timeline; fall back to utc rather than
+    # collapsing every frame onto a single instant.
+    if timebase == "utc" and "t_mono_us" in src.columns:
+        clock["forced_utc"] = True
+    if timebase != "utc" and "t_mono_us" in src.columns:
         mono = pd.to_numeric(src["t_mono_us"], errors="coerce").to_numpy(float) / 1e6
         good = np.isfinite(mono)
-        if good.sum() > 100:
+        degenerate = good.sum() > 0 and np.nanmax(mono[good]) - np.nanmin(mono[good]) <= 0.0
+        if degenerate:
+            clock["degenerate_mono"] = True
+        if good.sum() > 100 and not degenerate:
             off = (ep_utc - t0) - mono
             med = float(np.median(off[good]))
             dev = np.abs(off - med)
@@ -188,6 +196,11 @@ def print_health(h: dict, run_dur: float, interruptions=None) -> None:
         if c.get("utc_backsteps"):
             print(f"      ({c['utc_backsteps']:,} backward steps in `utc` avoided by "
                   f"not using it.)")
+    elif c.get("forced_utc"):
+        print("  timebase           : utc (forced by --timebase utc; t_mono_us ignored)")
+    elif c.get("degenerate_mono"):
+        print("  timebase           : utc (t_mono_us present but constant/all-zero - "
+              "unusable, fell back to wall clock)")
     else:
         print("  timebase           : utc (no t_mono_us column in this bundle)")
     if interruptions:
@@ -531,6 +544,11 @@ def main() -> int:
                         "at REL seconds from run start (e.g. gear=park@55). "
                         "Repeatable. A recurring state is what lets segments.py "
                         "reject counters.")
+    p.add_argument("--timebase", default="auto", choices=["auto", "utc"],
+                   help="'utc' forces the wall-clock stamps, ignoring t_mono_us. "
+                        "Use when the mono counter is discontinuous (e.g. it "
+                        "resets across can_link_lost outages, smearing the "
+                        "median re-anchor and compressing the CAN span).")
     p.add_argument("--no-health", action="store_true")
     args = p.parse_args()
 
@@ -539,7 +557,8 @@ def main() -> int:
     tag = args.tag or os.path.basename(os.path.normpath(args.run))
     os.makedirs(args.out_dir, exist_ok=True)
 
-    trace, health = convert_can(args.run, t0, args.start, args.end)
+    trace, health = convert_can(args.run, t0, args.start, args.end,
+                                timebase=args.timebase)
 
     if args.auto_window and health.get("n") and health["last_healthy"] > 0:
         end = health["last_healthy"]
@@ -547,7 +566,8 @@ def main() -> int:
             print(f"[auto-window] clipping to t<={end:.0f}s "
                   f"(last sustained full-rate bucket)\n")
             args.end = end
-            trace, health = convert_can(args.run, t0, args.start, args.end)
+            trace, health = convert_can(args.run, t0, args.start, args.end,
+                                        timebase=args.timebase)
 
     trace_path = os.path.join(args.out_dir, f"trace_{tag}.csv")
     trace.to_csv(trace_path, sep=";", index=False)
